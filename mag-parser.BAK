@@ -1,0 +1,26 @@
+[Unit]
+Description=node program 'musclememory'
+ConditionPathExists=/home/ec2-user/musmem/dist/bundle.js
+After=network.target
+ 
+[Service]
+Type=simple
+User=ec2-user
+Group=ec2-user
+
+Restart=on-failure
+
+WorkingDirectory=/home/ec2-user/musmem/dist
+ExecStart=/home/ec2-user/.nvm/versions/node/v22.17.0/bin/node bundle.js
+ 
+#  make sure log directory exists and owned by syslog
+#PermissionsStartOnly=true
+#ExecStartPre=/bin/mkdir -p /var/log/musclememory
+#ExecStartPre=/bin/chown syslog:adm /var/log/musclememory
+#ExecStartPre=/bin/chmod 755 /var/log/musclememory
+#StandardOutput=syslog
+#StandardError=syslog
+#SyslogIdentifier=/musclememory
+ 
+[Install]
+WantedBy=multi-user.target
