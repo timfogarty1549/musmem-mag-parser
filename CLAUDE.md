@@ -25,10 +25,13 @@ Request flow: `src/index.ts` (app setup: helmet CSP, CORS, rate limiting) → `s
   - `GET /` - verifies a JWT (`MAG_PARSER_SECRET`) from the `token` query parameter and returns a generated PDF (`application/pdf`) containing only that article's pages.
 - **`src/CreatePdfComponent.ts`** - `CreatePdfComponent` does the actual PDF work:
   - Maintains an in-memory LRU cache (`maxCacheSize = 10`) of generated article PDFs, keyed by a SHA-256 hash of the payload's `mag` filename and `pageRange` string.
-  - `fetchMag()` downloads the source magazine PDF from S3 (bucket from `S3_BUCKET_NAME`, region from `AWS_REGION`) using `@aws-sdk/client-s3` and loads it with `pdf-lib`.
-  - `createPdf()` creates a new `PDFDocument` with metadata (title/author from the payload, producer/creator set to MuscleMemory.org / Tim Fogarty). Uses `MagCodeService` to resolve the magazine series code to a name and sets the PDF subject with magazine name, month/year, and volume/issue when available.
-  - `extractArticle()` validates the requested 1-indexed page numbers against the source magazine's page count, then uses `pdf-lib`'s `copyPages` to copy those pages (preserving images, text layers, annotations) into the new document.
+  - `ensureMagOnDisk()` checks the `DiskCacheService` for a cached copy; on miss, streams the source magazine PDF from S3 directly to disk (never buffering the full file in memory) via `@aws-sdk/client-s3`. A `HeadObject` pre-flight check rejects missing keys fast and enforces a 200MB size limit.
+  - Page extraction uses `QpdfService` (wraps the `qpdf` CLI) to extract only the requested pages into a temp file — memory-efficient (~20MB) regardless of source magazine size.
+  - `pdf-lib` is used solely on the small extracted article (~2-10MB) to set metadata (title, author, subject with magazine name/month/year/volume/issue, producer/creator).
+  - Maintains an in-memory LRU cache (50MB) of generated article PDFs and a disk-based LRU cache (1.5GB) of source magazines.
 - **`src/MagParserPayload.ts`** - `MagParserPayload` interface (`mag`, `pageRange`, `title`, `author`, `exp`, plus optional `year`, `month`, `volume`, `issue`) describing the decoded JWT payload; `parsePageRange()` expands a `pageRange` string (e.g. `"1-5,63-65"`) into a `number[]` of 1-indexed page numbers; `isValidPayload()` validates the payload's shape (including that `pageRange` parses successfully) before use.
+- **`src/services/DiskCacheService.ts`** - LRU disk cache for source magazine PDFs. Stores files in `MAG_CACHE_DIR` (default `/tmp/mag-cache/`), keyed by SHA-256 hash of the S3 key. Evicts oldest files before writing when total size would exceed the 1.5GB limit. Supports both `put()` (from buffer) and `putFile()` (move/copy existing file).
+- **`src/services/QpdfService.ts`** - Wraps the `qpdf` CLI tool for memory-efficient page extraction. `extractPages()` runs `qpdf` with a 30s timeout. `buildPageArg()` collapses consecutive page numbers into ranges (e.g. `[5,6,63,64,68]` → `"5-6,63-64,68"`). `isAvailable()` checks if qpdf is installed (called on startup).
 - **`src/services/MagCodeService.ts`** - Singleton that fetches magazine series-code-to-name mappings from the main `musmem` API (`/api/mags/codes`) on startup, with retry logic (up to 6 attempts, 10s apart). Exposes `getName(code)` to resolve a series code (e.g. directory name in the S3 key) to a human-readable magazine title.
 - **`src/services/StatsService.ts`** - Singleton tracking server uptime (`initializedAt`) and total articles served (`articleCount`). Exposed via `GET /pdf/stats`.
 - **`src/services/logger.ts`** - Winston logger (timestamped, pretty-printed, console transport) used throughout for `info`/`warn`/`error`/`debug` logging.
@@ -69,8 +72,18 @@ All routes are mounted under `/pdf` (see `src/routes.ts`).
 - `AWS_REGION` - region for the S3 client (default `us-east-1`)
 - `S3_BUCKET_NAME` - bucket containing source magazine PDFs
 - `MAG_PARSER_SECRET` - shared HMAC secret for verifying JWTs issued by `musmem` (signed payload: `{ mag, pageRange, title, author, exp }`)
+- `MAG_CACHE_DIR` - directory for disk-cached source magazines (default: `/tmp/mag-cache/`)
 
 ## Notes
 
 - Module imports within `src/` use extensionless relative paths (e.g. `./services/logger`), matching the `musmem` repo's convention. `tsc`'s `NodeNext` module resolution accepts this for CommonJS packages (no `"type": "module"` in `package.json`).
 - `tsconfig.json` excludes `**/*.spec.ts` from compilation, anticipating colocated Jest spec files.
+
+## EC2 Configuration
+
+to use qpdf
+`
+sudo yum install -y qpdf
+sudo mkdir /var/cache/mag-parser
+sudo chown $(whoami):$(whoami) /var/cache/mag-parser
+`

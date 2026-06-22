@@ -7,6 +7,7 @@ import rateLimit from 'express-rate-limit';
 
 import logger from './services/logger';
 import MagCodeService from './services/MagCodeService';
+import { QpdfService } from './services/QpdfService';
 import { router as apiRouter } from './routes';
 import { Helper } from './utils/helper';
 
@@ -117,9 +118,19 @@ process.on('uncaughtException', (error: unknown) => {
 
 MagCodeService.initialize();
 
+const qpdf = new QpdfService();
+qpdf.isAvailable().then((available) => {
+  if (!available) {
+    logger.error('qpdf is not installed or not in PATH. PDF extraction will fail.');
+    logger.error('Install with: sudo yum install -y qpdf (AL2) or sudo apt-get install -y qpdf (Debian)');
+    process.exit(1);
+  }
+  logger.info('qpdf available');
+});
+
 // Periodic memory monitoring — warn before OOM
 const MEMORY_CHECK_INTERVAL_MS = 30_000;
-const MEMORY_WARN_THRESHOLD_MB = 400;
+const MEMORY_WARN_THRESHOLD_MB = 200;
 setInterval(() => {
   const memUsage = process.memoryUsage();
   const rssMB = Math.round(memUsage.rss / 1024 / 1024);
