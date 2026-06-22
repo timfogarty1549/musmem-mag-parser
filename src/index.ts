@@ -117,6 +117,18 @@ process.on('uncaughtException', (error: unknown) => {
 
 MagCodeService.initialize();
 
+// Periodic memory monitoring — warn before OOM
+const MEMORY_CHECK_INTERVAL_MS = 30_000;
+const MEMORY_WARN_THRESHOLD_MB = 400;
+setInterval(() => {
+  const memUsage = process.memoryUsage();
+  const rssMB = Math.round(memUsage.rss / 1024 / 1024);
+  const heapMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+  if (rssMB > MEMORY_WARN_THRESHOLD_MB) {
+    logger.warn(`High memory usage: ${heapMB}MB heap, ${rssMB}MB RSS`);
+  }
+}, MEMORY_CHECK_INTERVAL_MS).unref();
+
 // Start server only after data is loaded
 const server = app.listen(port, () => {
   logger.info(`MuscleMemory Magazine Parser v${process.env.VERSION}`);

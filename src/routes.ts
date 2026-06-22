@@ -10,6 +10,8 @@ import { isValidPayload, MagParserPayload } from './MagParserPayload';
 
 const router = express.Router();
 
+const REQUEST_TIMEOUT_MS = 55_000; // Respond before typical 60s gateway timeout
+
 export { router };
 
 router.get('/stats', (_req: express.Request, res: express.Response) => {
@@ -22,14 +24,14 @@ router.get('/version', (req: express.Request, res: express.Response) => {
     const bundlePath = path.join(__dirname, '../dist/bundle.js');
     const stats = fs.statSync(bundlePath);
     const date = stats.mtime.toISOString();
-    
-    res.json({ 
+
+    res.json({
       version: process.env.VERSION,
       date: date,
       internal: 1234
     });
   } catch (error: unknown) {
-    res.json({ 
+    res.json({
       version: process.env.VERSION,
       date: null
     });
@@ -37,6 +39,13 @@ router.get('/version', (req: express.Request, res: express.Response) => {
 });
 
 router.get('/', async (req: express.Request, res: express.Response) => {
+  const timeout = setTimeout(() => {
+    if (!res.headersSent) {
+      logger.error(`Request timed out after ${REQUEST_TIMEOUT_MS}ms for mag: ${(req.query.token as string)?.substring(0, 20)}...`);
+      res.status(504).json({ error: 'Request timed out' });
+    }
+  }, REQUEST_TIMEOUT_MS);
+
   try {
     const token = req.query.token ?? '';
     if (!token || typeof token !== 'string') {
@@ -61,11 +70,13 @@ router.get('/', async (req: express.Request, res: express.Response) => {
       return res.status(401).json({ error: 'Invalid or expired token' });
     }
 
-    const createPdfComponent = new CreatePdfComponent();
-    const result = await createPdfComponent.fetchArticle(payload);
+    const result = await CreatePdfComponent.getInstance().fetchArticle(payload);
+    if (res.headersSent) return;
+
     if ('error' in result) {
-      logger.warn(`Failed to fetch article: ${result.error}`);
-      return res.status(400).json({ error: 'Failed to fetch article', details: result.error });
+      const status = result.status || 400;
+      logger.warn(`Failed to fetch article (${status}): ${result.error}`);
+      return res.status(status).json({ error: 'Failed to fetch article', details: result.error });
     }
     const magId = path.basename(payload.mag, '.pdf');
     const filename = `${magId}_${payload.title}`.replace(/ /g, '-');
@@ -74,8 +85,11 @@ router.get('/', async (req: express.Request, res: express.Response) => {
     res.send(Buffer.from(result.pdf));
 
   } catch (error: unknown) {
+    if (res.headersSent) return;
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     logger.error(`Failed to parse PDF: ${errorMessage}`, error);
     res.status(500).json({ error: 'Failed to parse PDF', details: errorMessage });
+  } finally {
+    clearTimeout(timeout);
   }
 });
