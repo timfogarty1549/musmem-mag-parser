@@ -1,33 +1,48 @@
 import crypto from "crypto";
 import path from "path";
+import os from "os";
+import fs from "fs/promises";
+import { createWriteStream } from "fs";
+import { pipeline } from "stream/promises";
+import { Readable } from "stream";
 import { GetObjectCommand, HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { PDFDocument } from "pdf-lib";
 import logger from "./services/logger";
 import MagCodeService from "./services/MagCodeService";
 import StatsService from "./services/StatsService";
 import { MagParserPayload, parsePageRange } from "./MagParserPayload";
+import { DiskCacheService } from "./services/DiskCacheService";
+import { QpdfService } from "./services/QpdfService";
 
 const MONTH_NAMES = [
     'January', 'February', 'March', 'April', 'May', 'June',
     'July', 'August', 'September', 'October', 'November', 'December'
 ];
 
-const MAX_PDF_SIZE_BYTES = 200 * 1024 * 1024; // 200MB
-const MAX_CACHE_BYTES = 50 * 1024 * 1024; // 50MB total cache (tight on 1GB instance)
-const S3_TIMEOUT_MS = 30_000;
+const MAX_PDF_SIZE_BYTES = 200 * 1024 * 1024;
+const MAX_CACHE_BYTES = 50 * 1024 * 1024;
+const DISK_CACHE_BYTES = 1.5 * 1024 * 1024 * 1024;
+const S3_TIMEOUT_MS = 60_000;
+
+type EnsureMagResult = string | null | 'too_large';
 
 export class CreatePdfComponent {
     private static instance: CreatePdfComponent;
     private readonly cache = new Map<string, Uint8Array>();
     private cacheBytes = 0;
     private activeRequests = 0;
-    private readonly maxActiveRequests = 1; // 1GB instance can only safely process one large PDF at a time
+    private readonly maxActiveRequests = 3;
     private readonly s3: S3Client;
+    private readonly diskCache: DiskCacheService;
+    private readonly qpdf: QpdfService;
 
     private constructor() {
         this.s3 = new S3Client({
             region: process.env.AWS_REGION || 'us-east-1'
         });
+        const cacheDir = process.env.MAG_CACHE_DIR || path.join(os.tmpdir(), 'mag-cache');
+        this.diskCache = new DiskCacheService(cacheDir, DISK_CACHE_BYTES);
+        this.qpdf = new QpdfService();
     }
 
     public static getInstance(): CreatePdfComponent {
@@ -41,7 +56,7 @@ export class CreatePdfComponent {
         const cacheKey = this.buildCacheKey(payload);
         const cached = this.cache.get(cacheKey);
         if (cached) {
-            logger.info(`Article ${cacheKey} found in cache`);
+            logger.info(`Article cache hit: ${payload.title}`);
             this.cache.delete(cacheKey);
             this.cache.set(cacheKey, cached);
             return { pdf: cached };
@@ -61,27 +76,111 @@ export class CreatePdfComponent {
     }
 
     private async buildArticle(payload: MagParserPayload, cacheKey: string): Promise<{ pdf: Uint8Array } | { error: string; status?: number }> {
-        const mag = await this.fetchMag(payload.mag);
-        if (mag === 'too_large') {
+        const magPath = await this.ensureMagOnDisk(payload.mag);
+        if (magPath === 'too_large') {
             return { error: 'This magazine is too large to process. Please contact support.', status: 413 };
         }
-        if (!mag) {
+        if (!magPath) {
             return { error: 'The requested article could not be retrieved.', status: 404 };
         }
-        const newPdf = await this.createPdf(payload);
-        if (!newPdf) {
+
+        const pages = parsePageRange(payload.pageRange);
+        const tempOutput = path.join(os.tmpdir(), `article-${cacheKey.substring(0, 12)}.pdf`);
+        try {
+            await this.qpdf.extractPages(magPath, pages, tempOutput);
+        } catch (error: unknown) {
+            const msg = error instanceof Error ? error.message : String(error);
+            logger.error(`Failed to extract pages ${payload.pageRange} from ${payload.mag}: ${msg}`);
+            return { error: 'Failed to extract the requested pages.' };
+        }
+
+        try {
+            const extractedBytes = await fs.readFile(tempOutput);
+            const pdfDoc = await PDFDocument.load(extractedBytes);
+            this.setMetadata(pdfDoc, payload);
+            const pdfBytes = await pdfDoc.save();
+
+            this.addToCache(cacheKey, pdfBytes);
+            StatsService.incrementArticles();
+            return { pdf: pdfBytes };
+        } catch (error: unknown) {
+            const msg = error instanceof Error ? error.message : String(error);
+            logger.error(`Failed to set metadata on extracted article: ${msg}`);
             return { error: 'Failed to create PDF document.' };
+        } finally {
+            fs.unlink(tempOutput).catch(() => {});
         }
-        const pdfDoc = await this.extractArticle(newPdf, mag, parsePageRange(payload.pageRange));
-        if (!pdfDoc) {
-            return { error: `Failed to extract the requested pages.` };
+    }
+
+    private async ensureMagOnDisk(s3Key: string): Promise<EnsureMagResult> {
+        const cachedPath = await this.diskCache.get(s3Key);
+        if (cachedPath) {
+            logger.debug(`Disk cache hit: ${s3Key}`);
+            return cachedPath;
         }
-        const pdfBytes = await pdfDoc.save();
 
-        this.addToCache(cacheKey, pdfBytes);
+        try {
+            const head = await this.s3.send(new HeadObjectCommand({
+                Bucket: process.env.S3_BUCKET_NAME,
+                Key: s3Key
+            }));
 
-        StatsService.incrementArticles();
-        return { pdf: pdfBytes };
+            if (head.ContentLength && head.ContentLength > MAX_PDF_SIZE_BYTES) {
+                logger.error(`Magazine "${s3Key}" exceeds size limit: ${Math.round(head.ContentLength / 1024 / 1024)}MB`);
+                return 'too_large';
+            }
+        } catch (error: unknown) {
+            const name = (error as { name?: string }).name;
+            if (name === 'NotFound' || name === 'NoSuchKey') {
+                logger.warn(`Magazine not found in S3: bucket=${process.env.S3_BUCKET_NAME}, key=${s3Key}`);
+            } else {
+                logger.error(`S3 HeadObject error for "${s3Key}": ${(error as Error).message ?? error}`);
+            }
+            return null;
+        }
+
+        logger.info(`Downloading magazine from S3: ${s3Key}`);
+        try {
+            const response = await this.s3.send(
+                new GetObjectCommand({ Bucket: process.env.S3_BUCKET_NAME, Key: s3Key }),
+                { requestTimeout: S3_TIMEOUT_MS }
+            );
+
+            if (!response.Body) {
+                logger.warn(`Empty response body from S3 for: ${s3Key}`);
+                return null;
+            }
+
+            const tempPath = path.join(os.tmpdir(), `dl-${crypto.randomBytes(8).toString('hex')}.pdf`);
+            const body = response.Body as Readable;
+            await pipeline(body, createWriteStream(tempPath));
+            const stat = await fs.stat(tempPath);
+            const filePath = await this.diskCache.putFile(s3Key, tempPath);
+            logger.info(`Magazine cached to disk: ${s3Key} (${Math.round(stat.size / 1024 / 1024)}MB)`);
+            return filePath;
+        } catch (error: unknown) {
+            const name = (error as { name?: string }).name;
+            if (name === 'TimeoutError') {
+                logger.error(`S3 download timed out for "${s3Key}" after ${S3_TIMEOUT_MS}ms`);
+            } else {
+                logger.error(`S3 download error for "${s3Key}": ${(error as Error).message ?? error}`);
+            }
+            return null;
+        }
+    }
+
+    private setMetadata(pdfDoc: PDFDocument, article: MagParserPayload): void {
+        pdfDoc.setTitle(article.title);
+        pdfDoc.setAuthor(article.author);
+        const seriesCode = path.basename(path.dirname(article.mag));
+        const magName = MagCodeService.getName(seriesCode);
+        if (magName) {
+            pdfDoc.setSubject(this.buildSubject(article, magName));
+        }
+        pdfDoc.setProducer('MuscleMemory.org');
+        pdfDoc.setCreator('Tim Fogarty');
+        pdfDoc.setCreationDate(new Date());
+        pdfDoc.setModificationDate(new Date());
     }
 
     private buildCacheKey(payload: MagParserPayload): string {
@@ -92,19 +191,16 @@ export class CreatePdfComponent {
     private addToCache(cacheKey: string, pdfBytes: Uint8Array): void {
         const entrySize = pdfBytes.byteLength;
 
-        // Don't cache articles larger than half the cache limit
         if (entrySize > MAX_CACHE_BYTES / 2) {
-            logger.debug(`Article ${cacheKey} too large to cache (${Math.round(entrySize / 1024 / 1024)}MB)`);
+            logger.debug(`Article too large to cache (${Math.round(entrySize / 1024 / 1024)}MB)`);
             return;
         }
 
-        // Remove if already exists (to update position)
         if (this.cache.has(cacheKey)) {
             this.cacheBytes -= this.cache.get(cacheKey)!.byteLength;
             this.cache.delete(cacheKey);
         }
 
-        // Evict oldest entries until we have room
         while (this.cacheBytes + entrySize > MAX_CACHE_BYTES && this.cache.size > 0) {
             const firstKey = this.cache.keys().next().value;
             if (firstKey) {
@@ -117,60 +213,6 @@ export class CreatePdfComponent {
         this.cache.set(cacheKey, pdfBytes);
         this.cacheBytes += entrySize;
         logger.debug(`Article cached (${Math.round(entrySize / 1024)}KB). Cache: ${this.cache.size} items, ${Math.round(this.cacheBytes / 1024 / 1024)}MB`);
-    }
-
-    private async fetchMag(filename: string): Promise<PDFDocument | null | 'too_large'> {
-        // Pre-flight: check key exists and size before downloading
-        try {
-            const head = await this.s3.send(new HeadObjectCommand({
-                Bucket: process.env.S3_BUCKET_NAME,
-                Key: filename
-            }));
-
-            if (head.ContentLength && head.ContentLength > MAX_PDF_SIZE_BYTES) {
-                logger.error(`Magazine "${filename}" exceeds size limit: ${Math.round(head.ContentLength / 1024 / 1024)}MB`);
-                return 'too_large';
-            }
-        } catch (error: unknown) {
-            const name = (error as { name?: string }).name;
-            if (name === 'NotFound' || name === 'NoSuchKey') {
-                logger.warn(`Magazine not found in S3: bucket=${process.env.S3_BUCKET_NAME}, key=${filename}`);
-            } else {
-                logger.error(`S3 HeadObject error for "${filename}": ${(error as Error).message ?? error}`);
-            }
-            return null;
-        }
-
-        const command = new GetObjectCommand({
-            Bucket: process.env.S3_BUCKET_NAME,
-            Key: filename
-        });
-
-        let response;
-        try {
-            response = await this.s3.send(command, {
-                requestTimeout: S3_TIMEOUT_MS
-            });
-        } catch (error: unknown) {
-            const name = (error as { name?: string }).name;
-            if (name === 'NoSuchKey') {
-                logger.warn(`Magazine not found in S3: bucket=${process.env.S3_BUCKET_NAME}, key=${filename}`);
-            } else if (name === 'TimeoutError') {
-                logger.error(`S3 download timed out for "${filename}" after ${S3_TIMEOUT_MS}ms`);
-            } else {
-                logger.error(`S3 error fetching magazine "${filename}": ${(error as Error).message ?? error}`);
-            }
-            return null;
-        }
-
-        if (!response.Body) {
-            logger.warn(`Empty response body from S3 for: ${filename}`);
-            return null;
-        }
-
-        const pdfBytes = await response.Body.transformToByteArray();
-
-        return PDFDocument.load(pdfBytes);
     }
 
     private buildSubject(article: MagParserPayload, magName: string): string {
@@ -190,49 +232,5 @@ export class CreatePdfComponent {
         if (volParts.length > 0) parts.push(volParts.join(' '));
 
         return parts.join(', ');
-    }
-
-    private async createPdf(article: MagParserPayload): Promise<PDFDocument> {
-        const newDoc = await PDFDocument.create();
-        newDoc.setTitle(article.title);
-        newDoc.setAuthor(article.author);
-        const seriesCode = path.basename(path.dirname(article.mag));
-        const magName = MagCodeService.getName(seriesCode);
-        if (magName) {
-            newDoc.setSubject(this.buildSubject(article, magName));
-        }
-        newDoc.setProducer('MuscleMemory.org');
-        newDoc.setCreator('Tim Fogarty');
-        newDoc.setCreationDate(new Date());
-        newDoc.setModificationDate(new Date());
-
-        return newDoc;
-    }
-
-    private async extractArticle(newDoc: PDFDocument, mag: PDFDocument, pages: number[]): Promise<PDFDocument> {
-        // Validate pages are within range
-        const totalPages = mag.getPageCount();
-        const invalidPages = pages.filter((p) => p < 1 || p > totalPages);
-        if (invalidPages.length > 0) {
-            logger.warn(`Invalid page numbers: ${invalidPages.join(', ')}. Total pages: ${totalPages}`);
-        }
-
-        // Convert 1-indexed page numbers to 0-indexed for pdf-lib
-        const pagesToCopy = pages
-            .filter((p) => p >= 1 && p <= totalPages)
-            .map((p) => p - 1);
-
-        if (pagesToCopy.length === 0) {
-            logger.error('No valid pages to copy');
-            return newDoc;
-        }
-
-        // copyPages preserves all page content: images, OCR text layer, annotations, etc.
-        const copiedPages = await newDoc.copyPages(mag, pagesToCopy);
-        copiedPages.forEach((page) => {
-            newDoc.addPage(page);
-        });
-
-        return newDoc;
     }
 }
