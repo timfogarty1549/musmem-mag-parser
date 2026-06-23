@@ -84,7 +84,8 @@ export class CreatePdfComponent {
             return { error: 'The requested article could not be retrieved.', status: 404 };
         }
 
-        const pages = parsePageRange(payload.pageRange);
+        const offset = payload.offset ?? 0;
+        const pages = parsePageRange(payload.pageRange).map(p => p + offset);
         const tempOutput = path.join(os.tmpdir(), `article-${cacheKey.substring(0, 12)}.pdf`);
         try {
             await this.qpdf.extractPages(magPath, pages, tempOutput);
@@ -184,7 +185,7 @@ export class CreatePdfComponent {
     }
 
     private buildCacheKey(payload: MagParserPayload): string {
-        const raw = `${payload.mag}|${payload.pageRange}`;
+        const raw = `${payload.mag}|${payload.pageRange}|${payload.offset ?? 0}`;
         return crypto.createHash('sha256').update(raw).digest('hex');
     }
 

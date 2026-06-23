@@ -7,6 +7,7 @@ export interface MagParserPayload {
     month?: number | null;
     volume?: number | null;
     issue?: number | null;
+    offset?: number | null;
     exp: number;
 }
 
