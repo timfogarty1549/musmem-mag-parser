@@ -6,7 +6,8 @@ import logger from './services/logger';
 import StatsService from './services/StatsService';
 import { Helper } from './utils/helper';
 import { CreatePdfComponent } from './CreatePdfComponent';
-import { isValidPayload, MagParserPayload } from './MagParserPayload';
+import { isValidPayload, isValidPageViewerPayload, MagParserPayload, PageViewerPayload } from './MagParserPayload';
+import { PageImageComponent } from './PageImageComponent';
 
 const router = express.Router();
 
@@ -91,5 +92,73 @@ router.get('/', async (req: express.Request, res: express.Response) => {
     res.status(500).json({ error: 'Failed to parse PDF', details: errorMessage });
   } finally {
     clearTimeout(timeout);
+  }
+});
+
+function verifyPageViewerToken(req: express.Request, res: express.Response): PageViewerPayload | null {
+  const token = req.query.token;
+  if (!token || typeof token !== 'string') {
+    res.status(400).json({ error: 'Missing token' });
+    return null;
+  }
+
+  const secret = process.env.MAG_PARSER_SECRET;
+  if (!secret) {
+    logger.error('MAG_PARSER_SECRET is not configured');
+    res.status(500).json({ error: 'Server misconfiguration' });
+    return null;
+  }
+
+  try {
+    const decoded = jwt.verify(token, secret);
+    if (!isValidPageViewerPayload(decoded)) {
+      res.status(401).json({ error: 'Invalid token payload' });
+      return null;
+    }
+    return decoded;
+  } catch (error: unknown) {
+    logger.warn(`JWT verification failed: ${Helper.getErrorMessage(error)}`);
+    res.status(401).json({ error: 'Invalid or expired token' });
+    return null;
+  }
+}
+
+router.get('/page/info', async (req: express.Request, res: express.Response) => {
+  const payload = verifyPageViewerToken(req, res);
+  if (!payload) return;
+
+  try {
+    const result = await PageImageComponent.getInstance().getPageCount(payload.mag);
+    if ('error' in result) {
+      return res.status(result.status).json({ error: result.error });
+    }
+    res.json({ totalPages: result.totalPages });
+  } catch (error: unknown) {
+    logger.error(`Page info failed: ${Helper.getErrorMessage(error)}`);
+    res.status(500).json({ error: 'Failed to get page info' });
+  }
+});
+
+router.get('/page', async (req: express.Request, res: express.Response) => {
+  const payload = verifyPageViewerToken(req, res);
+  if (!payload) return;
+
+  const page = parseInt(req.query.page as string, 10);
+  if (isNaN(page) || page < 1 || page > payload.totalPages) {
+    return res.status(400).json({ error: `Invalid page number. Must be 1-${payload.totalPages}` });
+  }
+
+  try {
+    const result = await PageImageComponent.getInstance().getPageImage(payload.mag, page);
+    if ('error' in result) {
+      return res.status(result.status).json({ error: result.error });
+    }
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.setHeader('X-Robots-Tag', 'noindex');
+    res.sendFile(result.path);
+  } catch (error: unknown) {
+    logger.error(`Page render failed: ${Helper.getErrorMessage(error)}`);
+    res.status(500).json({ error: 'Failed to render page' });
   }
 });

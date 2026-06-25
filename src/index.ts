@@ -8,6 +8,7 @@ import rateLimit from 'express-rate-limit';
 import logger from './services/logger';
 import MagCodeService from './services/MagCodeService';
 import { QpdfService } from './services/QpdfService';
+import { PopplerService } from './services/PopplerService';
 import { router as apiRouter } from './routes';
 import { Helper } from './utils/helper';
 
@@ -88,7 +89,36 @@ const longTermLimiter = rateLimit({
   skipFailedRequests: false,
 });
 
-// Apply short-term and long-term limiters only to PDF routes
+const BOT_PATTERN = /bot|crawler|spider|scraper|curl|wget|python|java|perl|ruby|php|ahrefsbot|semrushbot|mj12bot|dotbot|rogerbot|seznambot|baiduspider|yandexbot|googlebot|bingbot|slurp|duckduckbot|facebookexternalhit|twitterbot|linkedinbot|telegrambot|whatsapp|discordbot|slackbot|applebot|gptbot|claudebot|anthropic-ai|perplexitybot|oai-searchbot|meta-externalagent|ia_archiver|archive\.org_bot/i;
+
+const botBlocker = (req: Request, res: Response, next: NextFunction) => {
+  const ua = req.headers['user-agent'] || '';
+  if (BOT_PATTERN.test(ua)) {
+    logger.info(`Blocked bot: ${ua.substring(0, 80)} from ${req.ip}`);
+    res.status(403).json({ error: 'Forbidden' });
+    return;
+  }
+  next();
+};
+
+// Global concurrency limit — reject requests when too many are in-flight,
+// regardless of source IP
+const MAX_CONCURRENT_REQUESTS = 6;
+let activeRequests = 0;
+const concurrencyLimiter = (req: Request, res: Response, next: NextFunction) => {
+  if (activeRequests >= MAX_CONCURRENT_REQUESTS) {
+    logger.warn(`Global concurrency limit hit (${activeRequests} active), rejecting ${req.ip}`);
+    res.status(503).json({ error: 'Server busy, please retry shortly' });
+    return;
+  }
+  activeRequests++;
+  res.on('close', () => { activeRequests--; });
+  next();
+};
+
+// Apply bot blocker, concurrency, and rate limiters to PDF routes
+app.use('/pdf', botBlocker);
+app.use('/pdf', concurrencyLimiter);
 app.use('/pdf', shortTermLimiter);
 app.use('/pdf', longTermLimiter);
 
@@ -126,6 +156,16 @@ qpdf.isAvailable().then((available) => {
     process.exit(1);
   }
   logger.info('qpdf available');
+});
+
+const poppler = new PopplerService();
+poppler.isAvailable().then((available) => {
+  if (!available) {
+    logger.error('pdftoppm is not installed or not in PATH. Page rendering will fail.');
+    logger.error('Install with: sudo yum install -y poppler-utils (AL2) or sudo apt-get install -y poppler-utils (Debian)');
+    process.exit(1);
+  }
+  logger.info('pdftoppm available');
 });
 
 // Periodic memory monitoring — warn before OOM

@@ -21,20 +21,23 @@ const MONTH_NAMES = [
 
 const MAX_PDF_SIZE_BYTES = 200 * 1024 * 1024;
 const MAX_CACHE_BYTES = 50 * 1024 * 1024;
-const DISK_CACHE_BYTES = 1.5 * 1024 * 1024 * 1024;
+const DISK_CACHE_BYTES = 4 * 1024 * 1024 * 1024;
 const S3_TIMEOUT_MS = 60_000;
 
 type EnsureMagResult = string | null | 'too_large';
+
+export type OnStaleCacheCallback = (s3Key: string) => void;
 
 export class CreatePdfComponent {
     private static instance: CreatePdfComponent;
     private readonly cache = new Map<string, Uint8Array>();
     private cacheBytes = 0;
     private activeRequests = 0;
-    private readonly maxActiveRequests = 3;
+    private readonly maxActiveRequests = 2;
     private readonly s3: S3Client;
     private readonly diskCache: DiskCacheService;
     private readonly qpdf: QpdfService;
+    private onStaleCallbacks: OnStaleCacheCallback[] = [];
 
     private constructor() {
         this.s3 = new S3Client({
@@ -50,6 +53,10 @@ export class CreatePdfComponent {
             CreatePdfComponent.instance = new CreatePdfComponent();
         }
         return CreatePdfComponent.instance;
+    }
+
+    public onStaleCache(callback: OnStaleCacheCallback): void {
+        this.onStaleCallbacks.push(callback);
     }
 
     public async fetchArticle(payload: MagParserPayload): Promise<{ pdf: Uint8Array } | { error: string; status?: number }> {
@@ -113,15 +120,10 @@ export class CreatePdfComponent {
         }
     }
 
-    private async ensureMagOnDisk(s3Key: string): Promise<EnsureMagResult> {
-        const cachedPath = await this.diskCache.get(s3Key);
-        if (cachedPath) {
-            logger.debug(`Disk cache hit: ${s3Key}`);
-            return cachedPath;
-        }
-
+    public async ensureMagOnDisk(s3Key: string): Promise<EnsureMagResult> {
+        let head;
         try {
-            const head = await this.s3.send(new HeadObjectCommand({
+            head = await this.s3.send(new HeadObjectCommand({
                 Bucket: process.env.S3_BUCKET_NAME,
                 Key: s3Key
             }));
@@ -140,6 +142,20 @@ export class CreatePdfComponent {
             return null;
         }
 
+        const cachedPath = await this.diskCache.get(s3Key);
+        if (cachedPath) {
+            const cachedEtag = await this.diskCache.getEtag(s3Key);
+            if (cachedEtag && cachedEtag === head.ETag) {
+                logger.debug(`Disk cache hit (ETag match): ${s3Key}`);
+                return cachedPath;
+            }
+            if (cachedEtag) {
+                logger.info(`S3 object changed (ETag mismatch), re-downloading: ${s3Key}`);
+                await this.diskCache.remove(s3Key);
+                for (const cb of this.onStaleCallbacks) cb(s3Key);
+            }
+        }
+
         logger.info(`Downloading magazine from S3: ${s3Key}`);
         try {
             const response = await this.s3.send(
@@ -156,7 +172,7 @@ export class CreatePdfComponent {
             const body = response.Body as Readable;
             await pipeline(body, createWriteStream(tempPath));
             const stat = await fs.stat(tempPath);
-            const filePath = await this.diskCache.putFile(s3Key, tempPath);
+            const filePath = await this.diskCache.putFile(s3Key, tempPath, head.ETag);
             logger.info(`Magazine cached to disk: ${s3Key} (${Math.round(stat.size / 1024 / 1024)}MB)`);
             return filePath;
         } catch (error: unknown) {

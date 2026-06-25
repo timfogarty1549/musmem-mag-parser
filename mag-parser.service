@@ -9,6 +9,8 @@ User=ec2-user
 Group=ec2-user
 
 Restart=on-failure
+MemoryHigh=600M
+MemoryMax=768M
 
 WorkingDirectory=/home/ec2-user/musmem-mag-parser/dist
 ExecStart=/home/ec2-user/.nvm/versions/node/v22.17.0/bin/node bundle.js

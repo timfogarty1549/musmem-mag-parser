@@ -28,6 +28,21 @@ export class DiskCacheService {
     }
   }
 
+  async getEtag(s3Key: string): Promise<string | null> {
+    const etagPath = this.keyToPath(s3Key) + '.etag';
+    try {
+      return (await fs.readFile(etagPath, 'utf-8')).trim();
+    } catch {
+      return null;
+    }
+  }
+
+  async remove(s3Key: string): Promise<void> {
+    const filePath = this.keyToPath(s3Key);
+    await fs.unlink(filePath).catch(() => {});
+    await fs.unlink(filePath + '.etag').catch(() => {});
+  }
+
   async put(s3Key: string, data: Buffer): Promise<string> {
     await this.initialize();
     await this.evictToFit(data.length);
@@ -36,7 +51,7 @@ export class DiskCacheService {
     return filePath;
   }
 
-  async putFile(s3Key: string, sourcePath: string): Promise<string> {
+  async putFile(s3Key: string, sourcePath: string, etag?: string): Promise<string> {
     await this.initialize();
     const stat = await fs.stat(sourcePath);
     await this.evictToFit(stat.size);
@@ -47,6 +62,9 @@ export class DiskCacheService {
       // rename fails across filesystem boundaries — fall back to copy+unlink
       await fs.copyFile(sourcePath, filePath);
       await fs.unlink(sourcePath);
+    }
+    if (etag) {
+      await fs.writeFile(filePath + '.etag', etag);
     }
     return filePath;
   }

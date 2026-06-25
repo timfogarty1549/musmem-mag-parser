@@ -43,6 +43,20 @@ export function parsePageRange(pageRange: string): number[] {
     return pages;
 }
 
+export interface PageViewerPayload {
+    mag: string;
+    totalPages: number;
+    exp: number;
+}
+
+export function isValidPageViewerPayload(payload: unknown): payload is PageViewerPayload {
+    if (typeof payload !== 'object' || payload === null) return false;
+    const p = payload as Record<string, unknown>;
+    if (typeof p.mag !== 'string' || p.mag.trim().length === 0) return false;
+    if (typeof p.totalPages !== 'number' || p.totalPages < 1) return false;
+    return true;
+}
+
 export function isValidPayload(payload: unknown): payload is MagParserPayload {
     if (typeof payload !== 'object' || payload === null) return false;
     const p = payload as Record<string, unknown>;
