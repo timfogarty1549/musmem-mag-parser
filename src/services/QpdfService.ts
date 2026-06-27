@@ -23,6 +23,12 @@ export class QpdfService {
         outputPath
       ], { timeout: QPDF_TIMEOUT_MS });
     } catch (error: unknown) {
+      // qpdf exit code 3 = succeeded with warnings; output file is valid
+      if ((error as NodeJS.ErrnoException & { code?: number }).code === 3) {
+        const msg = error instanceof Error ? error.message : String(error);
+        logger.warn(`qpdf completed with warnings for ${inputPath}: ${msg}`);
+        return;
+      }
       const msg = error instanceof Error ? error.message : String(error);
       logger.error(`qpdf extraction failed: ${msg}`);
       throw new Error(`Page extraction failed: ${msg}`);

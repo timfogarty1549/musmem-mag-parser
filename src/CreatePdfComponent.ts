@@ -38,6 +38,7 @@ export class CreatePdfComponent {
     private readonly diskCache: DiskCacheService;
     private readonly qpdf: QpdfService;
     private onStaleCallbacks: OnStaleCacheCallback[] = [];
+    private readonly pendingDownloads = new Map<string, Promise<EnsureMagResult>>();
 
     private constructor() {
         this.s3 = new S3Client({
@@ -121,6 +122,19 @@ export class CreatePdfComponent {
     }
 
     public async ensureMagOnDisk(s3Key: string): Promise<EnsureMagResult> {
+        const inflight = this.pendingDownloads.get(s3Key);
+        if (inflight) {
+            logger.debug(`Waiting for in-flight download: ${s3Key}`);
+            return inflight;
+        }
+        const promise = this.doEnsureMagOnDisk(s3Key).finally(() => {
+            this.pendingDownloads.delete(s3Key);
+        });
+        this.pendingDownloads.set(s3Key, promise);
+        return promise;
+    }
+
+    private async doEnsureMagOnDisk(s3Key: string): Promise<EnsureMagResult> {
         let head;
         try {
             head = await this.s3.send(new HeadObjectCommand({
